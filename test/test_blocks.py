@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import pathlib
 import random
 import sys
 import time
@@ -283,9 +284,9 @@ class TestComponentsInBlocks:
         for component in demo.blocks.values():
             if isinstance(component, gr.components.IOComponent):
                 if "Non-random" in component.label:
-                    assert not component.attach_load_event
+                    assert not component.load_event
                 else:
-                    assert component.attach_load_event
+                    assert component.load_event
         dependencies_on_load = [
             dep["trigger"] == "load" for dep in demo.config["dependencies"]
         ]
@@ -294,12 +295,10 @@ class TestComponentsInBlocks:
         assert not any([dep["queue"] for dep in demo.config["dependencies"]])
 
     def test_io_components_attach_load_events_when_value_is_fn(self, io_components):
-        io_components = [
-            comp for comp in io_components if comp not in [gr.State, gr.ScatterPlot]
-        ]
+        io_components = [comp for comp in io_components if comp not in [gr.State]]
         interface = gr.Interface(
             lambda *args: None,
-            inputs=[comp(value=lambda: None) for comp in io_components],
+            inputs=[comp(value=lambda: None, every=1) for comp in io_components],
             outputs=None,
         )
 
@@ -307,10 +306,20 @@ class TestComponentsInBlocks:
             dep for dep in interface.config["dependencies"] if dep["trigger"] == "load"
         ]
         assert len(dependencies_on_load) == len(io_components)
+        assert all([dep["every"] == 1 for dep in dependencies_on_load])
+
+    def test_get_load_events(self, io_components):
+        components = []
+        with gr.Blocks() as demo:
+            for component in io_components:
+                components.append(component(value=lambda: None, every=1))
+        assert [comp.load_event for comp in components] == demo.dependencies
 
     def test_blocks_do_not_filter_none_values_from_updates(self, io_components):
         io_components = [
-            c() for c in io_components if c not in [gr.State, gr.Button, gr.ScatterPlot]
+            c()
+            for c in io_components
+            if c not in [gr.State, gr.Button, gr.ScatterPlot, gr.LinePlot]
         ]
         with gr.Blocks() as demo:
             for component in io_components:
@@ -323,7 +332,7 @@ class TestComponentsInBlocks:
             )
 
         output = demo.postprocess_data(
-            0, [gr.update(value=None) for _ in io_components], state=None
+            0, [gr.update(value=None) for _ in io_components], state={}
         )
         assert all(
             [o["value"] == c.postprocess(None) for o, c in zip(output, io_components)]
@@ -339,7 +348,7 @@ class TestComponentsInBlocks:
                 outputs=text,
             )
 
-        output = demo.postprocess_data(0, gr.update(value="NO_VALUE"), state=None)
+        output = demo.postprocess_data(0, gr.update(value="NO_VALUE"), state={})
         assert output[0]["value"] == "NO_VALUE"
 
     def test_blocks_returns_correct_output_dict_single_key(self):
@@ -353,12 +362,10 @@ class TestComponentsInBlocks:
 
             update.click(update_values, inputs=[num], outputs=[num2])
 
-        output = demo.postprocess_data(
-            0, {num2: gr.Number.update(value=42)}, state=None
-        )
+        output = demo.postprocess_data(0, {num2: gr.Number.update(value=42)}, state={})
         assert output[0]["value"] == 42
 
-        output = demo.postprocess_data(0, {num2: 23}, state=None)
+        output = demo.postprocess_data(0, {num2: 23}, state={})
         assert output[0] == 23
 
     @pytest.mark.asyncio
@@ -979,6 +986,47 @@ class TestEvery:
                     else:
                         break
 
+    @pytest.mark.asyncio
+    async def test_generating_event_cancelled_if_ws_closed(self, capsys):
+        def generation():
+            for i in range(10):
+                time.sleep(0.1)
+                print(f"At step {i}")
+                yield i
+            return "Hello!"
+
+        with gr.Blocks() as demo:
+            greeting = gr.Textbox()
+            button = gr.Button(value="Greet")
+            button.click(generation, None, greeting)
+
+        app, _, _ = demo.queue(max_size=1).launch(prevent_thread_lock=True)
+
+        async with websockets.connect(
+            f"{demo.local_url.replace('http', 'ws')}queue/join"
+        ) as ws:
+            completed = False
+            n_steps = 0
+            while not completed:
+                msg = json.loads(await ws.recv())
+                if msg["msg"] == "send_data":
+                    await ws.send(json.dumps({"data": [0], "fn_index": 0}))
+                elif msg["msg"] == "send_hash":
+                    await ws.send(json.dumps({"fn_index": 0, "session_hash": "shdce"}))
+                elif msg["msg"] == "process_generating":
+                    if n_steps == 2:
+                        # Close the websocket
+                        break
+                    n_steps += 1
+                else:
+                    continue
+        await asyncio.sleep(1)
+        # If the generation function did not get cancelled
+        # it would have finished running and `At step 9` would
+        # have been printed
+        captured = capsys.readouterr()
+        assert "At step 9" not in captured.out
+
 
 class TestAddRequests:
     def test_no_type_hints(self):
@@ -1131,3 +1179,19 @@ async def test_queue_when_using_auth():
         *[run_ws(loop, tm + sleep_time * (i + 1) - 0.3, i) for i in range(3)]
     )
     await group
+
+
+def test_temp_file_sets_get_extended():
+    test_file_dir = pathlib.Path(pathlib.Path(__file__).parent, "test_files")
+
+    with gr.Blocks() as demo1:
+        gr.Video(str(test_file_dir / "video_sample.mp4"))
+
+    with gr.Blocks() as demo2:
+        gr.Audio(str(test_file_dir / "audio_sample.wav"))
+
+    with gr.Blocks() as demo3:
+        demo1.render()
+        demo2.render()
+
+    assert demo3.temp_file_sets == demo1.temp_file_sets + demo2.temp_file_sets

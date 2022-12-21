@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Type
 from urllib.parse import urlparse
 
 import fastapi
+import markupsafe
 import orjson
 import pkg_resources
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, status
@@ -55,11 +56,34 @@ with open(VERSION_FILE) as version_file:
 class ORJSONResponse(JSONResponse):
     media_type = "application/json"
 
+    @staticmethod
+    def _render(content: Any) -> bytes:
+        return orjson.dumps(
+            content,
+            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_PASSTHROUGH_DATETIME,
+            default=str,
+        )
+
     def render(self, content: Any) -> bytes:
-        return orjson.dumps(content, option=orjson.OPT_SERIALIZE_NUMPY)
+        return ORJSONResponse._render(content)
+
+    @staticmethod
+    def _render_str(content: Any) -> str:
+        return ORJSONResponse._render(content).decode("utf-8")
+
+
+def toorjson(value):
+    return markupsafe.Markup(
+        ORJSONResponse._render_str(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("'", "\\u0027")
+    )
 
 
 templates = Jinja2Templates(directory=STATIC_TEMPLATE_LIB)
+templates.env.filters["toorjson"] = toorjson
 
 
 ###########
@@ -236,17 +260,17 @@ class App(FastAPI):
                 return FileResponse(
                     io.BytesIO(file_data), attachment_filename=os.path.basename(path)
                 )
-            elif Path(app.cwd).resolve() in Path(path).resolve().parents or any(
-                Path(temp_dir).resolve() in Path(path).resolve().parents
-                for temp_dir in app.blocks.temp_dirs
-            ):
+            if Path(app.cwd).resolve() in Path(
+                path
+            ).resolve().parents or os.path.abspath(path) in set().union(
+                *app.blocks.temp_file_sets
+            ):  # Need to use os.path.abspath in the second condition to be consistent with usage in TempFileManager
                 return FileResponse(
                     Path(path).resolve(), headers={"Accept-Ranges": "bytes"}
                 )
             else:
                 raise ValueError(
-                    f"File cannot be fetched: {path}, perhaps because "
-                    f"it is not in any of {app.blocks.temp_dirs}"
+                    f"File cannot be fetched: {path}. All files must contained within the Gradio python app working directory, or be a temp file created by the Gradio python app."
                 )
 
         @app.get("/file/{path:path}", dependencies=[Depends(login_check)])
